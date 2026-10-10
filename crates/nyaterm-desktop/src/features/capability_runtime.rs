@@ -477,16 +477,12 @@ impl CapabilityRuntimeState {
         });
     }
 
-    pub(in crate::features) fn register_transfer(
-        &mut self,
-        transfer_id: String,
-        job: McpTransferJob,
-    ) {
+    fn register_transfer(&mut self, transfer_id: String, job: McpTransferJob) {
         self.prune_transfer_jobs();
         self.transfer_jobs.insert(transfer_id, job);
     }
 
-    pub(in crate::features) fn transfer_snapshot(
+    fn transfer_snapshot(
         &mut self,
         transfer_id: &str,
         connection_id: &str,
@@ -512,7 +508,7 @@ impl CapabilityRuntimeState {
         })
     }
 
-    pub(in crate::features) fn finish_transfer(
+    fn finish_transfer(
         &mut self,
         transfer_id: &str,
         outcome: Result<SftpTransferSummary, String>,
@@ -566,11 +562,11 @@ impl CapabilityRuntimeState {
         }
     }
 
-    pub(in crate::features) fn cancel_transfers_for_owner(&mut self, connection_id: &str) {
+    fn cancel_transfers_for_owner(&mut self, connection_id: &str) {
         self.cancel_matching_transfers(|job| job.owner_connection_id == connection_id);
     }
 
-    pub(in crate::features) fn cancel_transfers_for_generation(&mut self, generation: &str) {
+    fn cancel_transfers_for_generation(&mut self, generation: &str) {
         self.cancel_matching_transfers(|job| job.generation == generation);
     }
 }
