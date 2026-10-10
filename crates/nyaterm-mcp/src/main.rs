@@ -302,7 +302,7 @@ mod tests {
         )
         .await;
         let listed = receive_response(&mut client_lines, 2).await;
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 16);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
 
         send_client_message(
             &mut client_writer,

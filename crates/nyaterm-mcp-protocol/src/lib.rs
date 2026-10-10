@@ -24,6 +24,9 @@ pub mod capability {
     pub const SFTP_RENAME: &str = "sftp.rename";
     pub const SFTP_DELETE: &str = "sftp.delete";
     pub const SFTP_CHMOD: &str = "sftp.chmod";
+    pub const SFTP_DOWNLOAD: &str = "sftp.download";
+    pub const SFTP_UPLOAD: &str = "sftp.upload";
+    pub const TRANSFER_STATUS: &str = "transfer.status";
     pub const OUTPUT_READ: &str = "tool.output.read";
 }
 
@@ -43,6 +46,9 @@ pub mod tool {
     pub const SFTP_RENAME: &str = "sftp_rename";
     pub const SFTP_DELETE: &str = "sftp_delete";
     pub const SFTP_CHMOD: &str = "sftp_chmod";
+    pub const SFTP_DOWNLOAD: &str = "sftp_download";
+    pub const SFTP_UPLOAD: &str = "sftp_upload";
+    pub const TRANSFER_STATUS: &str = "transfer_status";
     pub const OUTPUT_READ: &str = "tool_output_read";
 }
 
@@ -222,6 +228,36 @@ pub const MCP_TOOL_REGISTRY: &[McpToolDefinition] = &[
         capability: capability::OUTPUT_READ,
         description: "Read another chunk of a large result produced on this MCP connection.",
         access: CapabilityAccess::SensitiveRead,
+        requires_session: false,
+        read_only_hint: true,
+        destructive_hint: false,
+        open_world_hint: false,
+    },
+    McpToolDefinition {
+        tool: tool::SFTP_DOWNLOAD,
+        capability: capability::SFTP_DOWNLOAD,
+        description: "Start a background binary download of a remote file into the MCP transfer sandbox, returning a transfer id to poll with transfer_status.",
+        access: CapabilityAccess::Write,
+        requires_session: true,
+        read_only_hint: false,
+        destructive_hint: false,
+        open_world_hint: true,
+    },
+    McpToolDefinition {
+        tool: tool::SFTP_UPLOAD,
+        capability: capability::SFTP_UPLOAD,
+        description: "Start a background binary upload of a sandbox file to the remote host, returning a transfer id to poll with transfer_status.",
+        access: CapabilityAccess::Write,
+        requires_session: true,
+        read_only_hint: false,
+        destructive_hint: false,
+        open_world_hint: true,
+    },
+    McpToolDefinition {
+        tool: tool::TRANSFER_STATUS,
+        capability: capability::TRANSFER_STATUS,
+        description: "Poll the progress and final result of an MCP binary transfer started with sftp_download or sftp_upload.",
+        access: CapabilityAccess::Read,
         requires_session: false,
         read_only_hint: true,
         destructive_hint: false,
@@ -410,6 +446,34 @@ pub struct OutputReadArgs {
     pub max_bytes: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SftpDownloadArgs {
+    pub session_id: String,
+    pub remote_path: String,
+    /// Destination path confined to the MCP transfer sandbox. May be relative to
+    /// the sandbox root (see `get_environment.transferDir`) or an absolute path
+    /// inside it.
+    pub local_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SftpUploadArgs {
+    pub session_id: String,
+    /// Source path confined to the MCP transfer sandbox. May be relative to the
+    /// sandbox root (see `get_environment.transferDir`) or an absolute path
+    /// inside it.
+    pub local_path: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransferStatusArgs {
+    pub transfer_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolContractError {
     pub tool: String,
@@ -439,6 +503,10 @@ pub struct EnvironmentResult {
     pub active_session_id: Option<String>,
     pub default_session_id: Option<String>,
     pub sessions: Vec<SessionSummary>,
+    /// Absolute path of the per-connection MCP transfer sandbox that
+    /// `sftp_download` writes into and `sftp_upload` reads from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -594,6 +662,23 @@ pub struct OutputChunkResult {
     pub eof: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SftpTransferResult {
+    pub transfer_id: String,
+    /// "download" or "upload".
+    pub direction: String,
+    /// "queued", "running", "completed", "failed", or "cancelled".
+    pub status: String,
+    pub remote_path: String,
+    pub local_path: String,
+    pub bytes_transferred: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 pub fn validate_tool_arguments(name: &str, value: &Value) -> Result<(), ToolContractError> {
     match name {
         tool::GET_ENVIRONMENT | tool::CONNECTION_LIST => {
@@ -688,6 +773,22 @@ pub fn validate_tool_arguments(name: &str, value: &Value) -> Result<(), ToolCont
                 return contract_error(name, "maxBytes must be between 1 and 65536");
             }
         }
+        tool::SFTP_DOWNLOAD => {
+            let args = parse_contract::<SftpDownloadArgs>(name, value)?;
+            require_identifier(name, "sessionId", &args.session_id)?;
+            require_path(name, "remotePath", &args.remote_path)?;
+            require_path(name, "localPath", &args.local_path)?;
+        }
+        tool::SFTP_UPLOAD => {
+            let args = parse_contract::<SftpUploadArgs>(name, value)?;
+            require_identifier(name, "sessionId", &args.session_id)?;
+            require_path(name, "localPath", &args.local_path)?;
+            require_path(name, "remotePath", &args.remote_path)?;
+        }
+        tool::TRANSFER_STATUS => {
+            let args = parse_contract::<TransferStatusArgs>(name, value)?;
+            require_identifier(name, "transferId", &args.transfer_id)?;
+        }
         _ => return contract_error(name, "unknown NyaTerm MCP tool"),
     }
     Ok(())
@@ -711,6 +812,9 @@ pub fn tool_input_schema(name: &str) -> Result<Value, ToolContractError> {
         tool::SFTP_RENAME => schema::<SftpRenameArgs>(),
         tool::SFTP_CHMOD => schema::<SftpChmodArgs>(),
         tool::OUTPUT_READ => schema::<OutputReadArgs>(),
+        tool::SFTP_DOWNLOAD => schema::<SftpDownloadArgs>(),
+        tool::SFTP_UPLOAD => schema::<SftpUploadArgs>(),
+        tool::TRANSFER_STATUS => schema::<TransferStatusArgs>(),
         _ => return contract_error(name, "unknown NyaTerm MCP tool"),
     })
 }
@@ -756,6 +860,22 @@ pub fn validate_tool_result(name: &str, value: &Value) -> Result<(), ToolContrac
         tool::SFTP_DELETE => validate_mutation(name, value, "deleted"),
         tool::SFTP_CHMOD => validate_mutation(name, value, "changed"),
         tool::OUTPUT_READ => parse_contract::<OutputChunkResult>(name, value).map(drop),
+        tool::SFTP_DOWNLOAD | tool::SFTP_UPLOAD | tool::TRANSFER_STATUS => {
+            let result = parse_contract::<SftpTransferResult>(name, value)?;
+            if !matches!(result.direction.as_str(), "download" | "upload") {
+                return contract_error(name, "direction must be download or upload");
+            }
+            if !matches!(
+                result.status.as_str(),
+                "queued" | "running" | "completed" | "failed" | "cancelled"
+            ) {
+                return contract_error(
+                    name,
+                    "status must be queued, running, completed, failed, or cancelled",
+                );
+            }
+            Ok(())
+        }
         _ => contract_error(name, "unknown NyaTerm MCP tool"),
     }
 }
@@ -929,13 +1049,13 @@ mod contract_tests {
     }
 
     #[test]
-    fn registry_contains_exactly_the_required_sixteen_tools_and_limits() {
-        assert_eq!(MCP_TOOL_REGISTRY.len(), 16);
+    fn registry_contains_exactly_the_required_tools_and_limits() {
+        assert_eq!(MCP_TOOL_REGISTRY.len(), 19);
         assert_eq!(
             MCP_TOOL_REGISTRY.first().unwrap().tool,
             tool::GET_ENVIRONMENT
         );
-        assert_eq!(MCP_TOOL_REGISTRY.last().unwrap().tool, tool::OUTPUT_READ);
+        assert_eq!(MCP_TOOL_REGISTRY.last().unwrap().tool, tool::TRANSFER_STATUS);
         assert_eq!(MAX_RPC_LINE_BYTES, 2 * 1024 * 1024);
         assert_eq!(MAX_INLINE_OUTPUT_BYTES, 64 * 1024);
         assert_eq!(MAX_TEXT_READ_BYTES, 64 * 1024);
@@ -1033,5 +1153,81 @@ mod contract_tests {
             }),
         };
         assert!(both.validate_envelope().is_err());
+    }
+
+    #[test]
+    fn transfer_tool_arguments_and_results_follow_the_contract() {
+        assert!(
+            validate_tool_arguments(
+                tool::SFTP_DOWNLOAD,
+                &serde_json::json!({
+                    "sessionId": "session-1",
+                    "remotePath": "/remote/file.bin",
+                    "localPath": "file.bin"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_arguments(
+                tool::SFTP_DOWNLOAD,
+                &serde_json::json!({
+                    "sessionId": "session-1",
+                    "remotePath": "/remote/file.bin",
+                    "localPath": "   "
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                tool::SFTP_UPLOAD,
+                &serde_json::json!({
+                    "sessionId": "session-1",
+                    "localPath": "file.bin",
+                    "remotePath": "/remote/file.bin"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_arguments(
+                tool::SFTP_UPLOAD,
+                &serde_json::json!({ "sessionId": "s", "localPath": "file.bin" })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments(tool::TRANSFER_STATUS, &serde_json::json!({})).is_err()
+        );
+
+        assert!(
+            validate_tool_result(
+                tool::SFTP_DOWNLOAD,
+                &serde_json::json!({
+                    "transferId": "xfer_1",
+                    "direction": "download",
+                    "status": "queued",
+                    "remotePath": "/remote/file.bin",
+                    "localPath": "/sandbox/file.bin",
+                    "bytesTransferred": 0
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_result(
+                tool::TRANSFER_STATUS,
+                &serde_json::json!({
+                    "transferId": "xfer_1",
+                    "direction": "download",
+                    "status": "not-a-status",
+                    "remotePath": "/r",
+                    "localPath": "/l",
+                    "bytesTransferred": 0
+                })
+            )
+            .is_err()
+        );
     }
 }

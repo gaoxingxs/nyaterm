@@ -2,6 +2,7 @@
 use super::NyaTermApp;
 use super::formatting::recent_terminal_output;
 use super::mcp::server::rpc_failure;
+use super::mcp::transfers_dir;
 use super::runtime_jobs::await_blocking_result;
 use crate::models::SessionLaunchConfig;
 use gpui::Context;
@@ -16,26 +17,92 @@ use nyaterm_core::models::sessions::Group;
 use nyaterm_mcp_protocol::{
     ConnectionListResult, ConnectionSummary, EnvironmentResult, MAX_INLINE_OUTPUT_BYTES,
     MutationResult, OutputReadArgs, PathArgs, RpcError, SessionArgs, SessionGetResult,
-    SessionOpenArgs, SessionOpenResult, SessionSummary, SftpChmodArgs, SftpFileEntry,
-    SftpHomeResult, SftpMkdirArgs, SftpReadTextArgs, SftpReadTextResult, SftpRenameArgs,
-    SftpStatResult, SftpWriteTextArgs, SftpWriteTextResult, TerminalExecuteArgs,
-    TerminalExecuteResult, TerminalRecentOutputArgs, TerminalRecentOutputResult,
-    definition_for_tool, tool, validate_tool_arguments, validate_tool_result,
+    SessionOpenArgs, SessionOpenResult, SessionSummary, SftpChmodArgs, SftpDownloadArgs,
+    SftpFileEntry, SftpHomeResult, SftpMkdirArgs, SftpReadTextArgs, SftpReadTextResult,
+    SftpRenameArgs, SftpStatResult, SftpTransferResult, SftpUploadArgs, SftpWriteTextArgs,
+    SftpWriteTextResult, TerminalExecuteArgs, TerminalExecuteResult, TerminalRecentOutputArgs,
+    TerminalRecentOutputResult, TransferStatusArgs, definition_for_tool, tool,
+    validate_tool_arguments, validate_tool_result,
 };
 use nyaterm_store::StoreDomain;
 use nyaterm_transport::{
-    SessionKind, SftpFileEntry as TransportFileEntry, SshProcessService, SshSessionConfig,
+    SessionKind, SftpFileEntry as TransportFileEntry, SftpTransferControl, SftpTransferOptions,
+    SftpTransferProgress, SftpTransferSummary, SshProcessService, SshSessionConfig,
     run_local_command,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 enum McpCommandTarget {
     Ssh(Box<SshSessionConfig>),
     Local { working_dir: Option<PathBuf> },
+}
+
+/// How long a finished MCP transfer is retained so a late `transfer_status`
+/// poll can still read its final result before it is pruned.
+const MCP_TRANSFER_RETENTION: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum McpTransferDirection {
+    Download,
+    Upload,
+}
+
+impl McpTransferDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Upload => "upload",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum McpTransferStatus {
+    #[default]
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl McpTransferStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Progress and final outcome of a single MCP binary transfer. Shared between
+/// the blocking transfer thread (which updates progress) and the GPUI thread
+/// (which reads it for `transfer_status` and finalizes the status).
+#[derive(Default)]
+struct McpTransferCell {
+    status: McpTransferStatus,
+    bytes_transferred: u64,
+    total_bytes: Option<u64>,
+    error: Option<String>,
+    finished_at: Option<Instant>,
+}
+
+struct McpTransferJob {
+    owner_connection_id: String,
+    generation: String,
+    direction: McpTransferDirection,
+    remote_path: String,
+    local_path: PathBuf,
+    control: SftpTransferControl,
+    cell: Arc<Mutex<McpTransferCell>>,
 }
 
 #[derive(Clone)]
@@ -119,6 +186,7 @@ pub(in crate::features) struct CapabilityRuntimeState {
     pub(in crate::features) outputs: HashMap<String, nyaterm_core::OutputStore>,
     active_requests: HashMap<String, (String, tokio_util::sync::CancellationToken)>,
     owners: HashMap<String, (CapabilityCaller, String)>,
+    transfer_jobs: HashMap<String, McpTransferJob>,
 }
 
 impl CapabilityRuntimeState {
@@ -177,6 +245,7 @@ impl CapabilityRuntimeState {
                 )));
             }
         }
+        self.cancel_transfers_for_generation(generation);
     }
 
     pub(in crate::features) fn prune_cancelled(&mut self) {
@@ -337,6 +406,7 @@ impl CapabilityRuntimeState {
         }
         self.session_grants
             .retain(|(connection_id, _, _)| connection_id != client_connection_id);
+        self.cancel_transfers_for_owner(client_connection_id);
         disconnected
     }
 
@@ -393,6 +463,115 @@ impl CapabilityRuntimeState {
         let _ = pending
             .reply
             .send(Err(rpc_failure("execution_failed", error)));
+    }
+
+    fn prune_transfer_jobs(&mut self) {
+        self.transfer_jobs.retain(|_, job| {
+            job.cell
+                .lock()
+                .map(|cell| {
+                    cell.finished_at
+                        .is_none_or(|finished| finished.elapsed() < MCP_TRANSFER_RETENTION)
+                })
+                .unwrap_or(false)
+        });
+    }
+
+    pub(in crate::features) fn register_transfer(
+        &mut self,
+        transfer_id: String,
+        job: McpTransferJob,
+    ) {
+        self.prune_transfer_jobs();
+        self.transfer_jobs.insert(transfer_id, job);
+    }
+
+    pub(in crate::features) fn transfer_snapshot(
+        &mut self,
+        transfer_id: &str,
+        connection_id: &str,
+    ) -> Option<SftpTransferResult> {
+        self.prune_transfer_jobs();
+        let job = self.transfer_jobs.get(transfer_id)?;
+        if job.owner_connection_id != connection_id {
+            return None;
+        }
+        let cell = job
+            .cell
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(SftpTransferResult {
+            transfer_id: transfer_id.to_string(),
+            direction: job.direction.as_str().to_string(),
+            status: cell.status.as_str().to_string(),
+            remote_path: job.remote_path.clone(),
+            local_path: job.local_path.to_string_lossy().to_string(),
+            bytes_transferred: cell.bytes_transferred,
+            total_bytes: cell.total_bytes,
+            error: cell.error.clone(),
+        })
+    }
+
+    pub(in crate::features) fn finish_transfer(
+        &mut self,
+        transfer_id: &str,
+        outcome: Result<SftpTransferSummary, String>,
+    ) {
+        let Some(job) = self.transfer_jobs.get(transfer_id) else {
+            return;
+        };
+        let cancelled = job.control.is_cancelled();
+        let mut cell = job
+            .cell
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match outcome {
+            Ok(summary) => {
+                cell.status = McpTransferStatus::Completed;
+                cell.bytes_transferred = summary.bytes;
+                cell.total_bytes = Some(summary.bytes);
+                cell.error = None;
+            }
+            Err(error) => {
+                cell.status = if cancelled {
+                    McpTransferStatus::Cancelled
+                } else {
+                    McpTransferStatus::Failed
+                };
+                cell.error = Some(error);
+            }
+        }
+        cell.finished_at = Some(Instant::now());
+    }
+
+    fn cancel_matching_transfers(&mut self, matches: impl Fn(&McpTransferJob) -> bool) {
+        let ids = self
+            .transfer_jobs
+            .iter()
+            .filter(|(_, job)| matches(job))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(job) = self.transfer_jobs.get(&id) {
+                job.control.cancel();
+                let mut cell = job
+                    .cell
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cell.finished_at.is_none() {
+                    cell.status = McpTransferStatus::Cancelled;
+                    cell.finished_at = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    pub(in crate::features) fn cancel_transfers_for_owner(&mut self, connection_id: &str) {
+        self.cancel_matching_transfers(|job| job.owner_connection_id == connection_id);
+    }
+
+    pub(in crate::features) fn cancel_transfers_for_generation(&mut self, generation: &str) {
+        self.cancel_matching_transfers(|job| job.generation == generation);
     }
 }
 
@@ -870,7 +1049,8 @@ impl NyaTermApp {
                 respond(request.reply, result);
             }
             tool::GET_ENVIRONMENT => {
-                respond(request.reply, self.mcp_environment(&scope));
+                let generation = request.generation.clone();
+                respond(request.reply, self.mcp_environment(&scope, &generation));
             }
             tool::CONNECTION_LIST => {
                 respond(request.reply, self.mcp_connection_list());
@@ -900,6 +1080,28 @@ impl NyaTermApp {
             | tool::SFTP_DELETE
             | tool::SFTP_CHMOD => {
                 self.dispatch_mcp_sftp_mutation(request, &scope, cx);
+            }
+            tool::SFTP_DOWNLOAD | tool::SFTP_UPLOAD => {
+                self.dispatch_mcp_sftp_transfer(request, &scope, cx);
+            }
+            tool::TRANSFER_STATUS => {
+                let args = serde_json::from_value::<TransferStatusArgs>(request.arguments)
+                    .expect("sidecar validated transfer status arguments");
+                let connection_id = request.connection_id.clone();
+                match self
+                    .mcp
+                    .capabilities
+                    .transfer_snapshot(&args.transfer_id, &connection_id)
+                {
+                    Some(value) => respond(request.reply, to_value(value)),
+                    None => respond(
+                        request.reply,
+                        Err(rpc_failure(
+                            "transfer_not_found",
+                            "The transfer is unknown, finished, or belongs to another connection.",
+                        )),
+                    ),
+                }
             }
             tool::TERMINAL_EXECUTE => {
                 if matches!(request.caller, CapabilityCaller::Native { .. }) {
@@ -946,7 +1148,11 @@ impl NyaTermApp {
             .collect()
     }
 
-    fn mcp_environment(&self, scope: &CapabilityScopeSnapshot) -> Result<Value, RpcError> {
+    fn mcp_environment(
+        &self,
+        scope: &CapabilityScopeSnapshot,
+        generation: &str,
+    ) -> Result<Value, RpcError> {
         let mut sessions = self
             .session
             .ordered_sessions()
@@ -968,10 +1174,14 @@ impl NyaTermApp {
             .active_id()
             .filter(|session_id| scope.session_ids.contains(*session_id))
             .map(str::to_string);
+        let transfer_dir = transfers_dir(generation)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string());
         to_value(EnvironmentResult {
             active_session_id,
             default_session_id: scope.default_session_id.clone(),
             sessions,
+            transfer_dir,
         })
     }
 
@@ -1578,6 +1788,181 @@ impl NyaTermApp {
         })
         .detach();
     }
+
+    fn dispatch_mcp_sftp_transfer(
+        &mut self,
+        request: CapabilityRequest,
+        scope: &CapabilityScopeSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = request
+            .arguments
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Err(error) = scope.require(&session_id) {
+            let _ = request
+                .reply
+                .send(Err(rpc_failure("scope_denied", &error.to_string())));
+            return;
+        }
+        let config = self
+            .session
+            .metadata(&session_id)
+            .and_then(|metadata| metadata.ssh_config.clone());
+        let Some(config) = config else {
+            let _ = request.reply.send(Err(rpc_failure(
+                "permission_denied",
+                "SFTP is unavailable for this session.",
+            )));
+            return;
+        };
+        let service = match self.remote_file_service_for_session(&session_id, config) {
+            Ok(service) => service,
+            Err(error) => {
+                let _ = request
+                    .reply
+                    .send(Err(rpc_failure("execution_failed", &error.to_string())));
+                return;
+            }
+        };
+        let (direction, remote_path, local_requested) = match request.tool.as_str() {
+            tool::SFTP_DOWNLOAD => {
+                let args = serde_json::from_value::<SftpDownloadArgs>(request.arguments)
+                    .expect("sidecar validated download arguments");
+                (
+                    McpTransferDirection::Download,
+                    args.remote_path,
+                    args.local_path,
+                )
+            }
+            tool::SFTP_UPLOAD => {
+                let args = serde_json::from_value::<SftpUploadArgs>(request.arguments)
+                    .expect("sidecar validated upload arguments");
+                (McpTransferDirection::Upload, args.remote_path, args.local_path)
+            }
+            other => unreachable!("unexpected MCP transfer tool: {other}"),
+        };
+        let sandbox_root = match transfers_dir(&request.generation) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = request.reply.send(Err(rpc_failure(
+                    "execution_failed",
+                    &format!("Cannot resolve the MCP transfer sandbox: {error}"),
+                )));
+                return;
+            }
+        };
+        let local_path = match confine_transfer_path(&sandbox_root, &local_requested) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = request
+                    .reply
+                    .send(Err(rpc_failure("invalid_argument", &error)));
+                return;
+            }
+        };
+
+        let transfer_id = format!("xfer_{}", uuid::Uuid::new_v4());
+        let control = SftpTransferControl::new();
+        let cell = Arc::new(Mutex::new(McpTransferCell::default()));
+        let options = SftpTransferOptions::default();
+
+        let reply_transfer_id = transfer_id.clone();
+        let reply_remote = remote_path.clone();
+        let reply_local = local_path.to_string_lossy().to_string();
+        let reply_direction = direction;
+
+        self.mcp.capabilities.register_transfer(
+            transfer_id.clone(),
+            McpTransferJob {
+                owner_connection_id: request.connection_id.clone(),
+                generation: request.generation.clone(),
+                direction,
+                remote_path: remote_path.clone(),
+                local_path: local_path.clone(),
+                control: control.clone(),
+                cell: cell.clone(),
+            },
+        );
+
+        let finalize_id = transfer_id.clone();
+        let progress_cell = cell;
+        match self
+            .blocking_jobs
+            .submit_task("mcp-sftp-transfer", move |_cancel| {
+                let progress = move |progress: SftpTransferProgress| {
+                    if let Ok(mut cell) = progress_cell.lock() {
+                        if cell.status == McpTransferStatus::Queued {
+                            cell.status = McpTransferStatus::Running;
+                        }
+                        cell.bytes_transferred = progress.bytes_transferred;
+                        cell.total_bytes = progress.total_bytes;
+                    }
+                };
+                if control.is_cancelled() {
+                    return Err("The MCP transfer was cancelled.".to_string());
+                }
+                let transferred = match direction {
+                    McpTransferDirection::Download => service
+                        .download_file_with_progress_and_control_options(
+                            &remote_path,
+                            local_path,
+                            control.clone(),
+                            options,
+                            progress,
+                        ),
+                    McpTransferDirection::Upload => service
+                        .upload_file_with_progress_and_control_options(
+                            local_path,
+                            &remote_path,
+                            control.clone(),
+                            options,
+                            progress,
+                        ),
+                };
+                transferred.map_err(|error| error.to_string())
+            }) {
+            Ok(task) => {
+                cx.spawn(async move |this, cx| {
+                    let outcome = await_blocking_result(Ok(task)).await;
+                    let _ = this.update(cx, |this, _cx| {
+                        this.mcp
+                            .capabilities
+                            .finish_transfer(&finalize_id, outcome);
+                    });
+                })
+                .detach();
+                respond(
+                    request.reply,
+                    to_value(SftpTransferResult {
+                        transfer_id: reply_transfer_id,
+                        direction: reply_direction.as_str().to_string(),
+                        status: "queued".to_string(),
+                        remote_path: reply_remote,
+                        local_path: reply_local,
+                        bytes_transferred: 0,
+                        total_bytes: None,
+                        error: None,
+                    }),
+                );
+            }
+            Err(_) => {
+                self.mcp.capabilities.finish_transfer(
+                    &transfer_id,
+                    Err("NyaTerm could not schedule the transfer.".to_string()),
+                );
+                respond(
+                    request.reply,
+                    Err(rpc_failure(
+                        "host_unavailable",
+                        "NyaTerm could not schedule the transfer.",
+                    )),
+                );
+            }
+        }
+    }
 }
 
 fn respond(
@@ -1593,6 +1978,53 @@ pub(in crate::features) fn to_value<T: serde::Serialize>(value: T) -> Result<Val
 
 fn to_value_string<T: serde::Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+/// Confine a client-supplied local transfer path to the per-generation sandbox.
+/// Relative paths resolve against `root`; absolute paths are accepted only when
+/// they resolve inside it. Parent-directory components and symlinks that would
+/// escape the sandbox are rejected, and the returned path is canonicalized so a
+/// symlinked intermediate directory cannot redirect the transfer elsewhere.
+fn confine_transfer_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let requested_path = Path::new(requested);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("localPath must not escape the MCP transfer sandbox".to_string());
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("Cannot create the MCP transfer sandbox: {error}"))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve the MCP transfer sandbox: {error}"))?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+        && metadata.file_type().is_symlink()
+    {
+        return Err("localPath must not be a symbolic link".to_string());
+    }
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => break,
+        }
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .unwrap_or_else(|_| canonical_root.clone());
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err("localPath must stay inside the MCP transfer sandbox".to_string());
+    }
+    let tail = candidate
+        .strip_prefix(existing)
+        .unwrap_or_else(|_| Path::new(""));
+    Ok(canonical_existing.join(tail))
 }
 
 fn session_kind_name(kind: SessionKind) -> &'static str {
@@ -1962,6 +2394,103 @@ mod tests {
         assert_eq!(
             mcp_grant_key(&request("mcp", CapabilityCaller::Mcp, "pwd")),
             mcp_grant_key(&request("mcp", CapabilityCaller::Mcp, "ls"))
+        );
+    }
+
+    #[test]
+    fn confine_transfer_path_keeps_downloads_and_uploads_inside_the_sandbox() {
+        use super::confine_transfer_path;
+        use nyaterm_core::test_support::TestTempDir;
+
+        let root = TestTempDir::new("nyaterm-mcp-confine");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+
+        let resolved = confine_transfer_path(root.path(), "nested/file.bin").unwrap();
+        assert!(resolved.starts_with(&canonical_root));
+        assert!(resolved.ends_with("file.bin"));
+
+        let inside = canonical_root.join("direct.bin");
+        assert_eq!(
+            confine_transfer_path(root.path(), inside.to_str().unwrap()).unwrap(),
+            inside
+        );
+
+        assert!(confine_transfer_path(root.path(), "../escape.bin").is_err());
+        let outside = std::env::temp_dir().join("nyaterm-mcp-outside-sandbox.bin");
+        assert!(confine_transfer_path(root.path(), outside.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_transfer_path_rejects_symlinked_escape() {
+        use super::confine_transfer_path;
+        use nyaterm_core::test_support::TestTempDir;
+
+        let root = TestTempDir::new("nyaterm-mcp-confine-link");
+        let outside = TestTempDir::new("nyaterm-mcp-confine-link-target");
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        assert!(confine_transfer_path(root.path(), "link/secret.bin").is_err());
+    }
+
+    #[test]
+    fn transfer_jobs_report_progress_and_cancel_on_owner_disconnect() {
+        use super::{McpTransferCell, McpTransferDirection, McpTransferJob};
+        use nyaterm_transport::{SftpTransferControl, SftpTransferSummary};
+        use std::sync::{Arc, Mutex};
+
+        let mut state = CapabilityRuntimeState::default();
+        let local = std::env::temp_dir().join("nyaterm-mcp-transfer-file.bin");
+        state.register_transfer(
+            "xfer_1".into(),
+            McpTransferJob {
+                owner_connection_id: "conn-1".into(),
+                generation: "gen-1".into(),
+                direction: McpTransferDirection::Download,
+                remote_path: "/remote/file.bin".into(),
+                local_path: local.clone(),
+                control: SftpTransferControl::new(),
+                cell: Arc::new(Mutex::new(McpTransferCell::default())),
+            },
+        );
+
+        let queued = state.transfer_snapshot("xfer_1", "conn-1").unwrap();
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.direction, "download");
+        assert!(state.transfer_snapshot("xfer_1", "another-connection").is_none());
+
+        state.finish_transfer(
+            "xfer_1",
+            Ok(SftpTransferSummary {
+                remote_path: "/remote/file.bin".into(),
+                local_path: local.clone(),
+                bytes: 42,
+                skipped: false,
+            }),
+        );
+        let done = state.transfer_snapshot("xfer_1", "conn-1").unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.bytes_transferred, 42);
+
+        let upload_control = SftpTransferControl::new();
+        state.register_transfer(
+            "xfer_2".into(),
+            McpTransferJob {
+                owner_connection_id: "conn-2".into(),
+                generation: "gen-1".into(),
+                direction: McpTransferDirection::Upload,
+                remote_path: "/remote/up.bin".into(),
+                local_path: local,
+                control: upload_control.clone(),
+                cell: Arc::new(Mutex::new(McpTransferCell::default())),
+            },
+        );
+        state.cancel_transfers_for_owner("conn-2");
+        assert!(upload_control.is_cancelled());
+        assert_eq!(
+            state.transfer_snapshot("xfer_2", "conn-2").unwrap().status,
+            "cancelled"
         );
     }
 }

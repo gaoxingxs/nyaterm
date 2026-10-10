@@ -3,6 +3,8 @@ pub(in crate::features) mod server;
 #[cfg(windows)]
 mod windows_acl;
 
+pub(in crate::features) use self::discovery::transfers_dir;
+
 use self::server::{McpHostEvent, McpHostRuntime, rpc_failure};
 use super::NyaTermApp;
 use super::ai::{McpHelperStatus, mcp_helper_status};
