@@ -508,11 +508,7 @@ impl CapabilityRuntimeState {
         })
     }
 
-    fn finish_transfer(
-        &mut self,
-        transfer_id: &str,
-        outcome: Result<SftpTransferSummary, String>,
-    ) {
+    fn finish_transfer(&mut self, transfer_id: &str, outcome: Result<SftpTransferSummary, String>) {
         let Some(job) = self.transfer_jobs.get(transfer_id) else {
             return;
         };
@@ -1836,7 +1832,11 @@ impl NyaTermApp {
             tool::SFTP_UPLOAD => {
                 let args = serde_json::from_value::<SftpUploadArgs>(request.arguments)
                     .expect("sidecar validated upload arguments");
-                (McpTransferDirection::Upload, args.remote_path, args.local_path)
+                (
+                    McpTransferDirection::Upload,
+                    args.remote_path,
+                    args.local_path,
+                )
             }
             other => unreachable!("unexpected MCP transfer tool: {other}"),
         };
@@ -1924,9 +1924,7 @@ impl NyaTermApp {
                 cx.spawn(async move |this, cx| {
                     let outcome = await_blocking_result(Ok(task)).await;
                     let _ = this.update(cx, |this, _cx| {
-                        this.mcp
-                            .capabilities
-                            .finish_transfer(&finalize_id, outcome);
+                        this.mcp.capabilities.finish_transfer(&finalize_id, outcome);
                     });
                 })
                 .detach();
@@ -2454,7 +2452,11 @@ mod tests {
         let queued = state.transfer_snapshot("xfer_1", "conn-1").unwrap();
         assert_eq!(queued.status, "queued");
         assert_eq!(queued.direction, "download");
-        assert!(state.transfer_snapshot("xfer_1", "another-connection").is_none());
+        assert!(
+            state
+                .transfer_snapshot("xfer_1", "another-connection")
+                .is_none()
+        );
 
         state.finish_transfer(
             "xfer_1",

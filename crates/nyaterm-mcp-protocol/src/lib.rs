@@ -1055,7 +1055,10 @@ mod contract_tests {
             MCP_TOOL_REGISTRY.first().unwrap().tool,
             tool::GET_ENVIRONMENT
         );
-        assert_eq!(MCP_TOOL_REGISTRY.last().unwrap().tool, tool::TRANSFER_STATUS);
+        assert_eq!(
+            MCP_TOOL_REGISTRY.last().unwrap().tool,
+            tool::TRANSFER_STATUS
+        );
         assert_eq!(MAX_RPC_LINE_BYTES, 2 * 1024 * 1024);
         assert_eq!(MAX_INLINE_OUTPUT_BYTES, 64 * 1024);
         assert_eq!(MAX_TEXT_READ_BYTES, 64 * 1024);
@@ -1197,9 +1200,7 @@ mod contract_tests {
             )
             .is_err()
         );
-        assert!(
-            validate_tool_arguments(tool::TRANSFER_STATUS, &serde_json::json!({})).is_err()
-        );
+        assert!(validate_tool_arguments(tool::TRANSFER_STATUS, &serde_json::json!({})).is_err());
 
         assert!(
             validate_tool_result(
