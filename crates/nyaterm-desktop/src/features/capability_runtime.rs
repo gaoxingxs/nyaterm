@@ -1997,11 +1997,22 @@ fn confine_transfer_path(root: &Path, requested: &str) -> Result<PathBuf, String
     let canonical_root = root
         .canonicalize()
         .map_err(|error| format!("Cannot resolve the MCP transfer sandbox: {error}"))?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
-        && metadata.file_type().is_symlink()
-    {
-        return Err("localPath must not be a symbolic link".to_string());
+    // Reject any symbolic link between the sandbox root and the target so a link
+    // cannot redirect the transfer, even before its target exists. `symlink_metadata`
+    // inspects the link itself rather than following it.
+    if let Ok(relative) = candidate.strip_prefix(root) {
+        let mut probe = root.to_path_buf();
+        for component in relative.components() {
+            probe.push(component.as_os_str());
+            if let Ok(metadata) = std::fs::symlink_metadata(&probe)
+                && metadata.file_type().is_symlink()
+            {
+                return Err("localPath must not traverse a symbolic link".to_string());
+            }
+        }
     }
+    // Canonicalize the deepest existing ancestor so a symlinked intermediate that
+    // slipped through (for example via an absolute path) still cannot escape.
     let mut existing = candidate.as_path();
     while !existing.exists() {
         match existing.parent() {
@@ -2424,8 +2435,13 @@ mod tests {
         let root = TestTempDir::new("nyaterm-mcp-confine-link");
         let outside = TestTempDir::new("nyaterm-mcp-confine-link-target");
         std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::create_dir_all(outside.path()).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         assert!(confine_transfer_path(root.path(), "link/secret.bin").is_err());
+        // A dangling link is rejected too, before its target is ever created.
+        std::os::unix::fs::symlink("/nonexistent-nyaterm-target", root.path().join("dangling"))
+            .unwrap();
+        assert!(confine_transfer_path(root.path(), "dangling/secret.bin").is_err());
     }
 
     #[test]
