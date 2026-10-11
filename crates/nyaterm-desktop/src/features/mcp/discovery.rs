@@ -133,18 +133,6 @@ pub(super) fn default_config_dir() -> anyhow::Result<PathBuf> {
     default_config_dir_from(&executable, dirs::home_dir().as_deref())
 }
 
-/// Root directory that holds every per-generation MCP transfer sandbox.
-pub(in crate::features) fn transfers_root() -> anyhow::Result<PathBuf> {
-    Ok(default_config_dir()?.join("mcp").join("transfers"))
-}
-
-/// The per-credential-generation sandbox that `sftp_download` writes into and
-/// `sftp_upload` reads from. Confining both directions to this directory keeps
-/// external MCP clients from reading or writing arbitrary local paths.
-pub(in crate::features) fn transfers_dir(generation: &str) -> anyhow::Result<PathBuf> {
-    Ok(transfers_root()?.join(generation))
-}
-
 fn default_config_dir_from(executable: &Path, home: Option<&Path>) -> anyhow::Result<PathBuf> {
     let directory = executable
         .parent()

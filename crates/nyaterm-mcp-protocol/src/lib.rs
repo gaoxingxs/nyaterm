@@ -236,7 +236,7 @@ pub const MCP_TOOL_REGISTRY: &[McpToolDefinition] = &[
     McpToolDefinition {
         tool: tool::SFTP_DOWNLOAD,
         capability: capability::SFTP_DOWNLOAD,
-        description: "Start a background binary download of a remote file into the MCP transfer sandbox, returning a transfer id to poll with transfer_status.",
+        description: "Start a background binary download of a remote file to a local path, returning a transfer id to poll with transfer_status. Refuses to overwrite an existing local file unless overwrite is true; the destination is approval-gated.",
         access: CapabilityAccess::Write,
         requires_session: true,
         read_only_hint: false,
@@ -451,10 +451,14 @@ pub struct OutputReadArgs {
 pub struct SftpDownloadArgs {
     pub session_id: String,
     pub remote_path: String,
-    /// Destination path confined to the MCP transfer sandbox. May be relative to
-    /// the sandbox root (see `get_environment.transferDir`) or an absolute path
-    /// inside it.
+    /// Local destination path. Under the trust model this may be any local path;
+    /// access is gated by the permission mode and the approval prompt. If a file
+    /// already exists there the download is refused unless `overwrite` is true.
     pub local_path: String,
+    /// Replace an existing file at `localPath`. Defaults to false, so a download
+    /// onto an existing path fails with a conflict instead of overwriting it.
+    #[serde(default)]
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -503,10 +507,6 @@ pub struct EnvironmentResult {
     pub active_session_id: Option<String>,
     pub default_session_id: Option<String>,
     pub sessions: Vec<SessionSummary>,
-    /// Absolute path of the per-connection MCP transfer sandbox that
-    /// `sftp_download` writes downloaded files into.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transfer_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

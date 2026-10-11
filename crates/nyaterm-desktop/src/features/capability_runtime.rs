@@ -2,7 +2,6 @@
 use super::NyaTermApp;
 use super::formatting::recent_terminal_output;
 use super::mcp::server::rpc_failure;
-use super::mcp::transfers_dir;
 use super::runtime_jobs::await_blocking_result;
 use crate::models::SessionLaunchConfig;
 use gpui::Context;
@@ -33,7 +32,7 @@ use nyaterm_transport::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1041,8 +1040,7 @@ impl NyaTermApp {
                 respond(request.reply, result);
             }
             tool::GET_ENVIRONMENT => {
-                let generation = request.generation.clone();
-                respond(request.reply, self.mcp_environment(&scope, &generation));
+                respond(request.reply, self.mcp_environment(&scope));
             }
             tool::CONNECTION_LIST => {
                 respond(request.reply, self.mcp_connection_list());
@@ -1140,11 +1138,7 @@ impl NyaTermApp {
             .collect()
     }
 
-    fn mcp_environment(
-        &self,
-        scope: &CapabilityScopeSnapshot,
-        generation: &str,
-    ) -> Result<Value, RpcError> {
+    fn mcp_environment(&self, scope: &CapabilityScopeSnapshot) -> Result<Value, RpcError> {
         let mut sessions = self
             .session
             .ordered_sessions()
@@ -1166,14 +1160,10 @@ impl NyaTermApp {
             .active_id()
             .filter(|session_id| scope.session_ids.contains(*session_id))
             .map(str::to_string);
-        let transfer_dir = transfers_dir(generation)
-            .ok()
-            .map(|path| path.to_string_lossy().to_string());
         to_value(EnvironmentResult {
             active_session_id,
             default_session_id: scope.default_session_id.clone(),
             sessions,
-            transfer_dir,
         })
     }
 
@@ -1819,7 +1809,7 @@ impl NyaTermApp {
                 return;
             }
         };
-        let (direction, remote_path, local_requested) = match request.tool.as_str() {
+        let (direction, remote_path, local_requested, overwrite) = match request.tool.as_str() {
             tool::SFTP_DOWNLOAD => {
                 let args = serde_json::from_value::<SftpDownloadArgs>(request.arguments)
                     .expect("sidecar validated download arguments");
@@ -1827,6 +1817,7 @@ impl NyaTermApp {
                     McpTransferDirection::Download,
                     args.remote_path,
                     args.local_path,
+                    args.overwrite.unwrap_or(false),
                 )
             }
             tool::SFTP_UPLOAD => {
@@ -1836,38 +1827,24 @@ impl NyaTermApp {
                     McpTransferDirection::Upload,
                     args.remote_path,
                     args.local_path,
+                    false,
                 )
             }
             other => unreachable!("unexpected MCP transfer tool: {other}"),
         };
-        // Downloads write a local file, so their destination is confined to the
-        // per-generation sandbox. Uploads only read a local source, so under the
-        // trust model the client may name any local path; access is gated by the
-        // permission mode and the approval prompt (which shows the source path).
-        let local_path = match direction {
-            McpTransferDirection::Download => {
-                let sandbox_root = match transfers_dir(&request.generation) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let _ = request.reply.send(Err(rpc_failure(
-                            "execution_failed",
-                            &format!("Cannot resolve the MCP transfer sandbox: {error}"),
-                        )));
-                        return;
-                    }
-                };
-                match confine_transfer_path(&sandbox_root, &local_requested) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let _ = request
-                            .reply
-                            .send(Err(rpc_failure("invalid_argument", &error)));
-                        return;
-                    }
-                }
-            }
-            McpTransferDirection::Upload => PathBuf::from(local_requested),
-        };
+        // Trust model: both directions may name any local path (uploads read a
+        // local source, downloads write a local destination); access is gated by
+        // the permission mode and the approval prompt, which shows the path.
+        let local_path = PathBuf::from(local_requested);
+        // A download refuses to clobber an existing local file unless the caller
+        // explicitly opts in with overwrite.
+        if direction == McpTransferDirection::Download && !overwrite && local_path.exists() {
+            let _ = request.reply.send(Err(rpc_failure(
+                "conflict",
+                "A file already exists at the download destination; pass overwrite=true to replace it.",
+            )));
+            return;
+        }
 
         let transfer_id = format!("xfer_{}", uuid::Uuid::new_v4());
         let control = SftpTransferControl::new();
@@ -1981,64 +1958,6 @@ pub(in crate::features) fn to_value<T: serde::Serialize>(value: T) -> Result<Val
 
 fn to_value_string<T: serde::Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|error| error.to_string())
-}
-
-/// Confine a client-supplied local transfer path to the per-generation sandbox.
-/// Relative paths resolve against `root`; absolute paths are accepted only when
-/// they resolve inside it. Parent-directory components and symlinks that would
-/// escape the sandbox are rejected, and the returned path is canonicalized so a
-/// symlinked intermediate directory cannot redirect the transfer elsewhere.
-fn confine_transfer_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let requested_path = Path::new(requested);
-    let candidate = if requested_path.is_absolute() {
-        requested_path.to_path_buf()
-    } else {
-        root.join(requested_path)
-    };
-    if candidate
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err("localPath must not escape the MCP transfer sandbox".to_string());
-    }
-    std::fs::create_dir_all(root)
-        .map_err(|error| format!("Cannot create the MCP transfer sandbox: {error}"))?;
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve the MCP transfer sandbox: {error}"))?;
-    // Reject any symbolic link between the sandbox root and the target so a link
-    // cannot redirect the transfer, even before its target exists. `symlink_metadata`
-    // inspects the link itself rather than following it.
-    if let Ok(relative) = candidate.strip_prefix(root) {
-        let mut probe = root.to_path_buf();
-        for component in relative.components() {
-            probe.push(component.as_os_str());
-            if let Ok(metadata) = std::fs::symlink_metadata(&probe)
-                && metadata.file_type().is_symlink()
-            {
-                return Err("localPath must not traverse a symbolic link".to_string());
-            }
-        }
-    }
-    // Canonicalize the deepest existing ancestor so a symlinked intermediate that
-    // slipped through (for example via an absolute path) still cannot escape.
-    let mut existing = candidate.as_path();
-    while !existing.exists() {
-        match existing.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
-            _ => break,
-        }
-    }
-    let canonical_existing = existing
-        .canonicalize()
-        .unwrap_or_else(|_| canonical_root.clone());
-    if !canonical_existing.starts_with(&canonical_root) {
-        return Err("localPath must stay inside the MCP transfer sandbox".to_string());
-    }
-    let tail = candidate
-        .strip_prefix(existing)
-        .unwrap_or_else(|_| Path::new(""));
-    Ok(canonical_existing.join(tail))
 }
 
 fn session_kind_name(kind: SessionKind) -> &'static str {
@@ -2197,17 +2116,28 @@ fn mcp_parameter_summary(tool_name: &str, arguments: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("?"),
         ),
-        tool::SFTP_DOWNLOAD => format!(
-            "download {} -> {}",
-            arguments
-                .get("remotePath")
-                .and_then(Value::as_str)
-                .unwrap_or("?"),
-            arguments
-                .get("localPath")
-                .and_then(Value::as_str)
-                .unwrap_or("?"),
-        ),
+        tool::SFTP_DOWNLOAD => {
+            let base = format!(
+                "download {} -> {}",
+                arguments
+                    .get("remotePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                arguments
+                    .get("localPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+            );
+            if arguments
+                .get("overwrite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                format!("{base} (overwrite)")
+            } else {
+                base
+            }
+        }
         _ => arguments
             .get("path")
             .or_else(|| arguments.get("connectionId"))
@@ -2431,48 +2361,6 @@ mod tests {
             mcp_grant_key(&request("mcp", CapabilityCaller::Mcp, "pwd")),
             mcp_grant_key(&request("mcp", CapabilityCaller::Mcp, "ls"))
         );
-    }
-
-    #[test]
-    fn confine_transfer_path_keeps_downloads_and_uploads_inside_the_sandbox() {
-        use super::confine_transfer_path;
-        use nyaterm_core::test_support::TestTempDir;
-
-        let root = TestTempDir::new("nyaterm-mcp-confine");
-        std::fs::create_dir_all(root.path()).unwrap();
-        let canonical_root = root.path().canonicalize().unwrap();
-
-        let resolved = confine_transfer_path(root.path(), "nested/file.bin").unwrap();
-        assert!(resolved.starts_with(&canonical_root));
-        assert!(resolved.ends_with("file.bin"));
-
-        let inside = canonical_root.join("direct.bin");
-        assert_eq!(
-            confine_transfer_path(root.path(), inside.to_str().unwrap()).unwrap(),
-            inside
-        );
-
-        assert!(confine_transfer_path(root.path(), "../escape.bin").is_err());
-        let outside = std::env::temp_dir().join("nyaterm-mcp-outside-sandbox.bin");
-        assert!(confine_transfer_path(root.path(), outside.to_str().unwrap()).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn confine_transfer_path_rejects_symlinked_escape() {
-        use super::confine_transfer_path;
-        use nyaterm_core::test_support::TestTempDir;
-
-        let root = TestTempDir::new("nyaterm-mcp-confine-link");
-        let outside = TestTempDir::new("nyaterm-mcp-confine-link-target");
-        std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::create_dir_all(outside.path()).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        assert!(confine_transfer_path(root.path(), "link/secret.bin").is_err());
-        // A dangling link is rejected too, before its target is ever created.
-        std::os::unix::fs::symlink("/nonexistent-nyaterm-target", root.path().join("dangling"))
-            .unwrap();
-        assert!(confine_transfer_path(root.path(), "dangling/secret.bin").is_err());
     }
 
     #[test]
