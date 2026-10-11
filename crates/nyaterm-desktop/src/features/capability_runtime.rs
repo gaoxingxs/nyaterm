@@ -1840,24 +1840,33 @@ impl NyaTermApp {
             }
             other => unreachable!("unexpected MCP transfer tool: {other}"),
         };
-        let sandbox_root = match transfers_dir(&request.generation) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = request.reply.send(Err(rpc_failure(
-                    "execution_failed",
-                    &format!("Cannot resolve the MCP transfer sandbox: {error}"),
-                )));
-                return;
+        // Downloads write a local file, so their destination is confined to the
+        // per-generation sandbox. Uploads only read a local source, so under the
+        // trust model the client may name any local path; access is gated by the
+        // permission mode and the approval prompt (which shows the source path).
+        let local_path = match direction {
+            McpTransferDirection::Download => {
+                let sandbox_root = match transfers_dir(&request.generation) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = request.reply.send(Err(rpc_failure(
+                            "execution_failed",
+                            &format!("Cannot resolve the MCP transfer sandbox: {error}"),
+                        )));
+                        return;
+                    }
+                };
+                match confine_transfer_path(&sandbox_root, &local_requested) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = request
+                            .reply
+                            .send(Err(rpc_failure("invalid_argument", &error)));
+                        return;
+                    }
+                }
             }
-        };
-        let local_path = match confine_transfer_path(&sandbox_root, &local_requested) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = request
-                    .reply
-                    .send(Err(rpc_failure("invalid_argument", &error)));
-                return;
-            }
+            McpTransferDirection::Upload => PathBuf::from(local_requested),
         };
 
         let transfer_id = format!("xfer_{}", uuid::Uuid::new_v4());
@@ -2176,6 +2185,28 @@ fn mcp_parameter_summary(tool_name: &str, arguments: &Value) -> String {
             } else {
                 ""
             },
+        ),
+        tool::SFTP_UPLOAD => format!(
+            "upload {} -> {}",
+            arguments
+                .get("localPath")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            arguments
+                .get("remotePath")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+        ),
+        tool::SFTP_DOWNLOAD => format!(
+            "download {} -> {}",
+            arguments
+                .get("remotePath")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            arguments
+                .get("localPath")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
         ),
         _ => arguments
             .get("path")
@@ -2506,5 +2537,22 @@ mod tests {
             state.transfer_snapshot("xfer_2", "conn-2").unwrap().status,
             "cancelled"
         );
+    }
+
+    #[test]
+    fn transfer_parameter_summaries_name_both_local_and_remote_paths() {
+        use super::mcp_parameter_summary;
+        let upload = mcp_parameter_summary(
+            tool::SFTP_UPLOAD,
+            &json!({"localPath": "/home/me/secret.txt", "remotePath": "/remote/x"}),
+        );
+        assert!(upload.contains("/home/me/secret.txt"), "{upload}");
+        assert!(upload.contains("/remote/x"), "{upload}");
+        let download = mcp_parameter_summary(
+            tool::SFTP_DOWNLOAD,
+            &json!({"localPath": "/sandbox/x", "remotePath": "/remote/y"}),
+        );
+        assert!(download.contains("/sandbox/x"), "{download}");
+        assert!(download.contains("/remote/y"), "{download}");
     }
 }

@@ -246,7 +246,7 @@ pub const MCP_TOOL_REGISTRY: &[McpToolDefinition] = &[
     McpToolDefinition {
         tool: tool::SFTP_UPLOAD,
         capability: capability::SFTP_UPLOAD,
-        description: "Start a background binary upload of a sandbox file to the remote host, returning a transfer id to poll with transfer_status.",
+        description: "Start a background binary upload of a local file to the remote host, returning a transfer id to poll with transfer_status. The local source path is approval-gated.",
         access: CapabilityAccess::Write,
         requires_session: true,
         read_only_hint: false,
@@ -461,9 +461,9 @@ pub struct SftpDownloadArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SftpUploadArgs {
     pub session_id: String,
-    /// Source path confined to the MCP transfer sandbox. May be relative to the
-    /// sandbox root (see `get_environment.transferDir`) or an absolute path
-    /// inside it.
+    /// Local source file to upload. Under the trust model this may be any local
+    /// path; access is gated by the permission mode and the approval prompt,
+    /// which shows this path.
     pub local_path: String,
     pub remote_path: String,
 }
@@ -504,7 +504,7 @@ pub struct EnvironmentResult {
     pub default_session_id: Option<String>,
     pub sessions: Vec<SessionSummary>,
     /// Absolute path of the per-connection MCP transfer sandbox that
-    /// `sftp_download` writes into and `sftp_upload` reads from.
+    /// `sftp_download` writes downloaded files into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_dir: Option<String>,
 }
